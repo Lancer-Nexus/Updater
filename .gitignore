@@ -1,0 +1,6 @@
+bin/
+obj/
+releases/
+data/
+logs/
+current.json
