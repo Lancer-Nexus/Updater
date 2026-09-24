@@ -12,6 +12,9 @@ Provide a secure and recoverable Windows/Linux bootstrapper for client and game-
 - Use staging directories, atomic activation and rollback.
 - Reject path traversal, unsafe archive entries and unexpected file types.
 - Keep private signing keys out of the updater and repository.
+- Keep the trusted root local to the bootstrapper and advance the persistent accepted-manifest version only after signature and policy verification.
+- Use the pinned root threshold and BouncyCastle Ed25519 verification; release signing remains an offline or protected publishing operation.
+- Accept only signed `tar.zst` package formats and use the pinned managed Zstandard decoder with strict TAR entry and expanded-size limits.
 - Do not require administrator privileges for per-user installations.
 - Do not start the client when required data packages are missing or invalid.
 - Keep logs useful but free of tokens, credentials and personal data.
