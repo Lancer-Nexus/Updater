@@ -21,31 +21,13 @@ public static class ReleaseActivator
     {
         if (healthTimeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(healthTimeout));
+        if (!IsCurrentVerified(manifest, clientPackage, options))
+            return StartResult.NotCurrent;
         var installRoot = Path.GetFullPath(options.InstallRootPath);
         var current = TryReadCurrentRelease(Path.Combine(installRoot, "current.json"));
-        if (current is null || current.PackageSha256 != clientPackage.Sha256 ||
-            current.ClientVersion != manifest.ClientVersion || current.BuildId != manifest.BuildId ||
-            current.DataManifestId != manifest.DataManifestId)
-            return StartResult.NotCurrent;
-
-        var releasePath = ResolveReleasePath(installRoot, current.ReleaseDirectory);
-        if (releasePath is null || !Directory.Exists(releasePath) ||
-            (File.GetAttributes(releasePath) & FileAttributes.ReparsePoint) != 0 ||
-            !MetadataMatches(Path.Combine(releasePath, "client-version.json"), manifest) ||
-            !DataPackageStager.MatchesSnapshot(releasePath, manifest, options.OptionalDataPackages))
-            return StartResult.NotCurrent;
-
+        var releasePath = ResolveReleasePath(installRoot, current!.ReleaseDirectory)!;
         var executableName = OperatingSystem.IsWindows() ? "lancer.exe" : "lancer";
         var executablePath = Path.Combine(releasePath, executableName);
-        if (!File.Exists(executablePath) || (File.GetAttributes(executablePath) & FileAttributes.ReparsePoint) != 0)
-            return StartResult.NotCurrent;
-        if (!OperatingSystem.IsWindows())
-        {
-            var mode = File.GetUnixFileMode(executablePath);
-            if ((mode & (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) == 0)
-                return StartResult.NotCurrent;
-        }
-
         bool healthy;
         try { healthy = await StartAndAwaitHealthAsync(executablePath, releasePath, installRoot, healthTimeout, cancellationToken); }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException or System.ComponentModel.Win32Exception)
@@ -55,6 +37,34 @@ public static class ReleaseActivator
         }
         if (healthy) MarkCurrentHealthy(installRoot);
         return healthy ? StartResult.Healthy : StartResult.Failed;
+    }
+
+    public static bool IsCurrentVerified(UpdateManifest manifest, UpdatePackage clientPackage, UpdaterOptions options)
+    {
+        var installRoot = Path.GetFullPath(options.InstallRootPath);
+        var current = TryReadCurrentRelease(Path.Combine(installRoot, "current.json"));
+        if (current is null || current.PackageSha256 != clientPackage.Sha256 ||
+            current.ClientVersion != manifest.ClientVersion || current.BuildId != manifest.BuildId ||
+            current.DataManifestId != manifest.DataManifestId)
+            return false;
+
+        var releasePath = ResolveReleasePath(installRoot, current.ReleaseDirectory);
+        if (releasePath is null || !Directory.Exists(releasePath) ||
+            (File.GetAttributes(releasePath) & FileAttributes.ReparsePoint) != 0 ||
+            !MetadataMatches(Path.Combine(releasePath, "client-version.json"), manifest) ||
+            !DataPackageStager.MatchesSnapshot(releasePath, manifest, options.OptionalDataPackages))
+            return false;
+
+        var executable = Path.Combine(releasePath, OperatingSystem.IsWindows() ? "lancer.exe" : "lancer");
+        if (!File.Exists(executable) || (File.GetAttributes(executable) & FileAttributes.ReparsePoint) != 0)
+            return false;
+        if (!OperatingSystem.IsWindows())
+        {
+            var mode = File.GetUnixFileMode(executable);
+            if ((mode & (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) == 0)
+                return false;
+        }
+        return true;
     }
 
     public static bool RollbackCurrent(UpdaterOptions options)

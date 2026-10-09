@@ -14,6 +14,12 @@ The Updater is the cross-platform Windows/Linux bootstrapper for the Lancer Nexu
 
 The updater must remain independent from the game client so it can repair or replace a broken client installation.
 
+## Process modes and Launcher status contract
+
+`--prepare-only` verifies signed metadata, downloads and validates missing packages, repairs or stages the complete active snapshot, and exits without starting the game. `--start-current` requires an already verified snapshot matching the signed manifest, starts that release, waits for the Client UI-ready acknowledgement, and exits with a failure code if the release is not healthy. With no mode flag, the Updater keeps the combined update-and-start behavior.
+
+When `LANCER_NEXUS_STATUS_FILE` is set, the Updater atomically writes a bounded schema-v1 JSON document containing `schemaVersion`, string `state`, `message`, `installedVersion`, `installationVerified`, and optional `errorCode`. The Launcher trusts a `Ready` document only when the process exits successfully and `installationVerified` is true. Status files contain no credentials or manifest signatures.
+
 ## Current verification runtime
 
 The .NET 10 console entry point loads an HTTPS manifest from `LANCER_NEXUS_MANIFEST_URL` (or its first argument). Redirects and responses over 2 MiB are rejected. `LANCER_NEXUS_TRUST_ROOT` names a local, trusted JSON file (default `trusted-root.json`) provisioned with the bootstrapper through a trusted channel. The updater never downloads this root from the manifest URL. Private release keys never belong here.

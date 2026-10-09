@@ -12,7 +12,8 @@ public sealed record UpdaterOptions(
     public static UpdaterOptions FromEnvironment(string[] args)
     {
         var raw = Environment.GetEnvironmentVariable("LANCER_NEXUS_MANIFEST_URL") ??
-                  (args.Length > 0 ? args[0] : "https://downloads.example.net/v1/channels/stable/manifest");
+                  (args.FirstOrDefault(argument => !argument.StartsWith("--", StringComparison.Ordinal)) ??
+                   "https://downloads.example.net/v1/channels/stable/manifest");
         if (!Uri.TryCreate(raw, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps)
             throw new InvalidOperationException("Manifest URL muss HTTPS verwenden.");
         var channel = Environment.GetEnvironmentVariable("LANCER_NEXUS_CHANNEL") ?? "stable";
