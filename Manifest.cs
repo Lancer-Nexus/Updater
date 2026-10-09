@@ -40,11 +40,15 @@ public sealed record TrustRoot(int Schema, int Threshold, IReadOnlyList<TrustedK
 public static class ManifestClient
 {
     public static async Task<SignedManifest> LoadAsync(Uri uri, CancellationToken cancellationToken)
+        => await LoadAsync(uri, cancellationToken, null);
+
+    internal static async Task<SignedManifest> LoadAsync(
+        Uri uri, CancellationToken cancellationToken, HttpMessageHandler? testHandler)
     {
         if (!uri.IsAbsoluteUri || uri.Scheme != Uri.UriSchemeHttps)
             throw new InvalidOperationException("Manifest URL muss HTTPS verwenden.");
-        using var handler = new HttpClientHandler { AllowAutoRedirect = false };
-        using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(30) };
+        using var handler = testHandler ?? new HttpClientHandler { AllowAutoRedirect = false };
+        using var client = new HttpClient(handler, disposeHandler: testHandler is null) { Timeout = TimeSpan.FromSeconds(30) };
         using var response = await client.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         response.EnsureSuccessStatusCode();
         const int maximumBytes = 2_097_152;
