@@ -229,6 +229,7 @@ public static class DataPackageStager
             }
             await output.FlushAsync(cancellationToken);
             output.Flush(flushToDisk: true);
+            await output.DisposeAsync();
             if (total != package.Size || !CryptographicOperations.FixedTimeEquals(
                     hash.GetHashAndReset(), Convert.FromHexString(package.Sha256)))
                 throw new InvalidDataException($"NAP-Paket '{package.Id}' änderte sich nach dem Download.");

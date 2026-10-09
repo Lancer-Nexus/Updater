@@ -53,7 +53,7 @@ public sealed class StartupHealthTests
         }
         finally
         {
-            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+            await DeleteDirectoryAsync(root);
         }
     }
 
@@ -87,7 +87,7 @@ public sealed class StartupHealthTests
         }
         finally
         {
-            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+            await DeleteDirectoryAsync(root);
         }
     }
 
@@ -129,7 +129,7 @@ public sealed class StartupHealthTests
         }
         finally
         {
-            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+            await DeleteDirectoryAsync(root);
         }
     }
 
@@ -185,6 +185,24 @@ public sealed class StartupHealthTests
         {
             // The process has already exited and its PID is no longer present.
         }
+    }
+
+    private static async Task DeleteDirectoryAsync(string path)
+    {
+        for (var attempt = 0; attempt < 40 && Directory.Exists(path); attempt++)
+        {
+            try
+            {
+                Directory.Delete(path, recursive: true);
+                return;
+            }
+            catch (Exception error) when (OperatingSystem.IsWindows() &&
+                                          error is IOException or UnauthorizedAccessException)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(50));
+            }
+        }
+        if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
     }
 
     private static UpdateManifest Manifest(string version, string build, string data)
