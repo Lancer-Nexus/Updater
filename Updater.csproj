@@ -9,6 +9,8 @@
   <ItemGroup>
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.7.0" />
     <PackageReference Include="ZstdSharp.Port" Version="0.8.8" />
+    <InternalsVisibleTo Include="Updater.Tests" />
+    <InternalsVisibleTo Include="activation-crash-probe" />
   </ItemGroup>
   <ItemGroup>
     <Compile Remove="Tests/**/*.cs" />

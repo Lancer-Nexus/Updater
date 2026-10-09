@@ -36,7 +36,7 @@ public static class ReleaseStager
             var metadata = new ClientVersionMetadata(
                 manifest.ClientVersion, manifest.BuildId, manifest.ProtocolVersion,
                 manifest.DataManifestId, $"{manifest.Platform}-{manifest.Architecture}",
-                manifest.Channel, manifest.Capabilities);
+                manifest.Channel, manifest.Capabilities, 1);
             await using var metadataFile = new FileStream(Path.Combine(stageDirectory, "client-version.json"),
                 FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.Asynchronous | FileOptions.WriteThrough);
             await JsonSerializer.SerializeAsync(metadataFile, metadata, TrustRoot.JsonOptions, cancellationToken);
@@ -83,6 +83,7 @@ public static class ReleaseStager
                 continue;
             }
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            DiskSpaceGuard.EnsureAvailable(Path.GetDirectoryName(path)!, length);
             await using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None,
                 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
             if (entry.DataStream is null)
@@ -175,5 +176,6 @@ public static class ReleaseStager
 
     private sealed record ClientVersionMetadata(
         string ClientVersion, string BuildId, int ProtocolVersion, string DataManifestId,
-        string Platform, string Channel, IReadOnlyList<string> Capabilities);
+        string Platform, string Channel, IReadOnlyList<string> Capabilities,
+        int StartupHealthProtocolVersion);
 }

@@ -15,7 +15,14 @@ public sealed record UpdateManifest(
 }
 
 public sealed record UpdatePackage(
-    string Id, string Version, string Url, long Size, string Sha256, bool Required, string Format = "");
+    string Id, string Version, string Url, long Size, string Sha256, bool Required, string Format = "")
+{
+    public ulong? ContentVersion { get; init; }
+    public int Priority { get; init; }
+    public int MountOrder { get; init; }
+    public IReadOnlyList<string> Dependencies { get; init; } = [];
+    public IReadOnlyList<string> Overrides { get; init; } = [];
+}
 public sealed record ManifestSignature(string KeyId, string Algorithm, string Value);
 public sealed record SignedManifest(string Signed, IReadOnlyList<ManifestSignature> Signatures);
 public sealed record TrustedKey(string KeyId, string Algorithm, string PublicKey);
@@ -77,6 +84,17 @@ public static class ManifestVerifier
         if (payload.Length is 0 or > 1_048_576)
             throw new InvalidDataException("Manifest-Payload ist zu groß oder leer.");
 
+        UpdateManifest manifest;
+        try
+        {
+            var canonicalPayload = ManifestCanonicalizer.Canonicalize(payload);
+            if (!payload.AsSpan().SequenceEqual(canonicalPayload))
+                throw new InvalidDataException("Manifest-Payload ist nicht RFC 8785 kanonisiert.");
+            manifest = JsonSerializer.Deserialize<UpdateManifest>(payload, TrustRoot.JsonOptions)
+                ?? throw new InvalidDataException("Manifest ist leer.");
+        }
+        catch (JsonException error) { throw new InvalidDataException("Manifest-Payload ist kein gültiges JSON.", error); }
+
         var validKeys = new HashSet<string>(StringComparer.Ordinal);
         foreach (var signature in envelope.Signatures)
         {
@@ -100,10 +118,6 @@ public static class ManifestVerifier
         if (validKeys.Count < root.Threshold)
             throw new InvalidDataException("Manifest-Signaturschwelle nicht erreicht.");
 
-        UpdateManifest manifest;
-        try { manifest = JsonSerializer.Deserialize<UpdateManifest>(payload, TrustRoot.JsonOptions)
-            ?? throw new InvalidDataException("Manifest ist leer."); }
-        catch (JsonException error) { throw new InvalidDataException("Manifest-Payload ist kein gültiges JSON.", error); }
         if (manifest.Schema != 1 || manifest.Version < root.MinimumManifestVersion ||
             manifest.Channel != options.Channel || manifest.Platform != options.Platform ||
             manifest.Architecture != options.Architecture)
@@ -127,9 +141,13 @@ public static class ManifestVerifier
             throw new InvalidDataException("Updater-Version ist für dieses Manifest zu alt.");
         foreach (var package in manifest.Packages)
         {
-            if (string.IsNullOrWhiteSpace(package.Id) || string.IsNullOrWhiteSpace(package.Version) ||
+            if (string.IsNullOrWhiteSpace(package.Id) || package.Id.Length > 96 ||
+                package.Id.Any(c => !(char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.')) ||
+                string.IsNullOrWhiteSpace(package.Version) ||
             package.Size <= 0 || package.Sha256?.Length != 64 || !package.Sha256.All(Uri.IsHexDigit) ||
-                package.Format != "tar.zst" ||
+                (package.Id == "client" ? package.Format != "tar.zst" :
+                    package.Format != "nap" || !package.ContentVersion.HasValue ||
+                    package.Dependencies is null || package.Overrides is null) ||
                 !Uri.TryCreate(package.Url, UriKind.Relative, out var relative) ||
                 package.Url.StartsWith('/') || package.Url.StartsWith('\\') ||
                 package.Url.Contains('\\') || package.Url.Contains('?') || package.Url.Contains('#') ||
@@ -139,6 +157,41 @@ public static class ManifestVerifier
         }
         if (manifest.Packages.Select(p => p.Id).Distinct(StringComparer.Ordinal).Count() != manifest.Packages.Count)
             throw new InvalidDataException("Manifest enthält doppelte Paket-IDs.");
+        var dataPackages = manifest.Packages.Where(p => p.Id != "client").ToArray();
+        var dataIds = dataPackages.Select(p => p.Id).ToHashSet(StringComparer.Ordinal);
+        if (dataPackages.GroupBy(p => (p.Priority, p.MountOrder)).Any(g => g.Count() > 1))
+            throw new InvalidDataException("NAP-Pakete benötigen je Priorität eine eindeutige Mount-Reihenfolge.");
+        foreach (var package in dataPackages)
+        {
+            if (package.Dependencies.Any(id => !dataIds.Contains(id) || id == package.Id) ||
+                package.Overrides.Any(id => !dataIds.Contains(id) || id == package.Id) ||
+                package.Dependencies.Distinct(StringComparer.Ordinal).Count() != package.Dependencies.Count ||
+                package.Overrides.Distinct(StringComparer.Ordinal).Count() != package.Overrides.Count)
+                throw new InvalidDataException($"NAP-Paket '{package.Id}' hat ungültige Abhängigkeiten oder Overrides.");
+        }
+        var visit = new Dictionary<string, byte>(StringComparer.Ordinal);
+        var byId = dataPackages.ToDictionary(p => p.Id, StringComparer.Ordinal);
+        int CompareMountOrder(UpdatePackage left, UpdatePackage right)
+        {
+            var comparison = left.Priority.CompareTo(right.Priority);
+            if (comparison == 0) comparison = left.MountOrder.CompareTo(right.MountOrder);
+            return comparison == 0 ? StringComparer.Ordinal.Compare(left.Id, right.Id) : comparison;
+        }
+        foreach (var package in dataPackages)
+            foreach (var prerequisiteId in package.Dependencies.Concat(package.Overrides))
+                if (CompareMountOrder(byId[prerequisiteId], package) >= 0)
+                    throw new InvalidDataException($"NAP-Paket '{prerequisiteId}' muss vor '{package.Id}' gemountet werden.");
+        bool HasDependencyCycle(string id)
+        {
+            if (visit.TryGetValue(id, out var state)) return state == 1;
+            visit[id] = 1;
+            foreach (var dependency in byId[id].Dependencies)
+                if (HasDependencyCycle(dependency)) return true;
+            visit[id] = 2;
+            return false;
+        }
+        if (dataIds.Any(HasDependencyCycle))
+            throw new InvalidDataException("NAP-Paketabhängigkeiten enthalten einen Zyklus.");
         return manifest;
     }
 }

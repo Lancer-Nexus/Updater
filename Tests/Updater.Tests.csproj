@@ -7,8 +7,31 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../Updater.csproj" />
+    <ProjectReference Include="StartupHealthProbe/StartupHealthProbe.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="ActivationCrashProbe/ActivationCrashProbe.csproj" ReferenceOutputAssembly="false" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="coverlet.collector" Version="10.1.0">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.0.0" />
   </ItemGroup>
+  <ItemGroup>
+    <Compile Remove="StartupHealthProbe/**/*.cs;ActivationCrashProbe/**/*.cs" />
+  </ItemGroup>
+  <Target Name="CopyStartupHealthProbe" AfterTargets="Build">
+    <ItemGroup>
+      <StartupHealthProbeFiles Include="$(MSBuildThisFileDirectory)StartupHealthProbe/bin/$(Configuration)/net10.0/*" />
+    </ItemGroup>
+    <MakeDir Directories="$(OutDir)health-probe" />
+    <Copy SourceFiles="@(StartupHealthProbeFiles)" DestinationFolder="$(OutDir)health-probe" />
+  </Target>
+  <Target Name="CopyActivationCrashProbe" AfterTargets="Build">
+    <ItemGroup>
+      <ActivationCrashProbeFiles Include="$(MSBuildThisFileDirectory)ActivationCrashProbe/bin/$(Configuration)/net10.0/*" />
+    </ItemGroup>
+    <MakeDir Directories="$(OutDir)activation-probe" />
+    <Copy SourceFiles="@(ActivationCrashProbeFiles)" DestinationFolder="$(OutDir)activation-probe" />
+  </Target>
 </Project>

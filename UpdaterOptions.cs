@@ -5,6 +5,8 @@ public sealed record UpdaterOptions(
     string TrustRootPath, string StatePath = "", Uri? ArtifactBaseUri = null,
     string CachePath = "", string InstallRootPath = "")
 {
+    public IReadOnlySet<string> OptionalDataPackages { get; init; } = new HashSet<string>(StringComparer.Ordinal);
+
     public Uri EffectiveArtifactBaseUri => ArtifactBaseUri ?? new Uri(ManifestUri.GetLeftPart(UriPartial.Authority) + "/v1/");
 
     public static UpdaterOptions FromEnvironment(string[] args)
@@ -27,6 +29,12 @@ public sealed record UpdaterOptions(
               string.IsNullOrEmpty(configuredBase.Query) && string.IsNullOrEmpty(configuredBase.Fragment)
                 ? configuredBase
                 : throw new InvalidOperationException("Artefakt-Basis muss eine HTTPS-URL mit abschließendem '/' sein.");
+        var optionalPackages = (Environment.GetEnvironmentVariable("LANCER_NEXUS_OPTIONAL_PACKAGES") ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToHashSet(StringComparer.Ordinal);
+        if (optionalPackages.Any(id => id.Length > 96 ||
+                id.Any(c => !(char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.'))))
+            throw new InvalidOperationException("Die Liste optionaler Datenpakete enthält eine ungültige Paket-ID.");
         return new UpdaterOptions(uri, channel, platform, architecture,
             Environment.GetEnvironmentVariable("LANCER_NEXUS_TRUST_ROOT") ?? "trusted-root.json",
             Environment.GetEnvironmentVariable("LANCER_NEXUS_METADATA_STATE") ??
@@ -36,6 +44,9 @@ public sealed record UpdaterOptions(
             Environment.GetEnvironmentVariable("LANCER_NEXUS_PACKAGE_CACHE") ??
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "lancer-nexus", "packages"),
             Environment.GetEnvironmentVariable("LANCER_NEXUS_INSTALL_ROOT") ??
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LancerNexus"));
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LancerNexus"))
+        {
+            OptionalDataPackages = optionalPackages
+        };
     }
 }

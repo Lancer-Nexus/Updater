@@ -8,14 +8,19 @@ permissions:
   contents: read
 
 jobs:
-  dotnet:
-    runs-on: ubuntu-24.04
+  updater:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-      - run: dotnet restore
+      - run: dotnet restore Tests/Updater.Tests.csproj
       - run: dotnet format --verify-no-changes --no-restore
-      - run: dotnet build --configuration Release --no-restore --warnaserror
-      - run: dotnet test --configuration Release --no-build --logger trx --collect:"XPlat Code Coverage"
+      - run: dotnet format Tests/Updater.Tests.csproj --verify-no-changes --no-restore
+      - run: dotnet test Tests/Updater.Tests.csproj --configuration Release --no-restore --logger trx --collect:"XPlat Code Coverage"
+      - run: dotnet build Updater.csproj --configuration Release --no-restore --warnaserror

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text;
 using LancerNexus.Updater;
 using Org.BouncyCastle.Crypto.Parameters;
 using Org.BouncyCastle.Crypto.Signers;
@@ -49,11 +50,44 @@ public sealed class ManifestVerifierTests
     }
 
     [Fact]
+    public void ManifestCanonicalizationSortsKeysAndUsesCanonicalStringEscapes()
+    {
+        var input = Encoding.UTF8.GetBytes("{\"z\":1,\"a\":\"\\n/é\",\"b\":true}");
+        var canonical = ManifestCanonicalizer.Canonicalize(input);
+
+        Assert.Equal("{\"a\":\"\\n/é\",\"b\":true,\"z\":1}", Encoding.UTF8.GetString(canonical));
+        Assert.Throws<InvalidDataException>(() => ManifestCanonicalizer.Canonicalize(
+            Encoding.UTF8.GetBytes("{\"n\":9007199254740992}")));
+        Assert.Throws<InvalidDataException>(() => ManifestCanonicalizer.Canonicalize(
+            Encoding.UTF8.GetBytes("{\"n\":1.0}")));
+        Assert.Throws<InvalidDataException>(() => ManifestCanonicalizer.Canonicalize(
+            Encoding.UTF8.GetBytes("\"\\uD800\"")));
+        Assert.Throws<InvalidDataException>(() => ManifestCanonicalizer.Canonicalize(
+            Encoding.UTF8.GetBytes("{\"\\uD800\":1}")));
+    }
+
+    [Fact]
+    public void NoncanonicalAndDuplicatePropertyManifestsAreRejected()
+    {
+        var (envelope, root) = SignedManifestFor(TestManifest(), 1);
+        var payload = Convert.FromBase64String(envelope.Signed);
+        var noncanonical = new SignedManifest(Convert.ToBase64String([.. Encoding.UTF8.GetBytes(" "), .. payload]),
+            envelope.Signatures);
+        Assert.Throws<InvalidDataException>(() => ManifestVerifier.Validate(noncanonical, root, Options, Now));
+
+        var duplicateProperties = Encoding.UTF8.GetBytes("{\"a\":1,\"a\":1}");
+        Assert.Throws<InvalidDataException>(() => ManifestCanonicalizer.Canonicalize(duplicateProperties));
+    }
+
+    [Fact]
     public void TamperingExpiryRollbackAndWrongPlatformAreRejected()
     {
         var (envelope, root) = SignedManifestFor(TestManifest(), 1);
-        var tampered = envelope with { Signed = Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(
-            TestManifest() with { ClientVersion = "9.9.9" }, TrustRoot.JsonOptions)) };
+        var tampered = envelope with
+        {
+            Signed = Convert.ToBase64String(ManifestCanonicalizer.Serialize(
+            TestManifest() with { ClientVersion = "9.9.9" }))
+        };
         Assert.Throws<InvalidDataException>(() => ManifestVerifier.Validate(tampered, root, Options, Now));
         Assert.Throws<InvalidDataException>(() => ManifestVerifier.Validate(envelope,
             root with { MinimumManifestVersion = 8 }, Options, Now));
@@ -78,6 +112,32 @@ public sealed class ManifestVerifierTests
         Assert.Throws<InvalidDataException>(() => ManifestVerifier.Validate(unsafeEnvelope, unsafeRoot, Options, Now));
     }
 
+    [Fact]
+    public void SignedManifestAcceptsNapPackagesAndRejectsInvalidDependencyGraph()
+    {
+        var bytes = new byte[] { 1, 2, 3 };
+        var dataPackage = new UpdatePackage("core", "1", "packages/core.nap", bytes.Length,
+            Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)).ToLowerInvariant(), true, "nap")
+        {
+            ContentVersion = 1,
+            Priority = 100,
+            MountOrder = 1
+        };
+        var manifest = TestManifest() with { Packages = [TestManifest().Packages[0], dataPackage] };
+        var (envelope, root) = SignedManifestFor(manifest, 1);
+        Assert.Equal("core", ManifestVerifier.Validate(envelope, root, Options, Now).Packages[1].Id);
+
+        var cyclic = dataPackage with { Dependencies = ["core"] };
+        var cyclicManifest = manifest with { Packages = [manifest.Packages[0], cyclic] };
+        var (cyclicEnvelope, cyclicRoot) = SignedManifestFor(cyclicManifest, 1);
+        Assert.Throws<InvalidDataException>(() => ManifestVerifier.Validate(cyclicEnvelope, cyclicRoot, Options, Now));
+
+        var invalidFormat = dataPackage with { Format = "tar.zst" };
+        var invalidManifest = manifest with { Packages = [manifest.Packages[0], invalidFormat] };
+        var (invalidEnvelope, invalidRoot) = SignedManifestFor(invalidManifest, 1);
+        Assert.Throws<InvalidDataException>(() => ManifestVerifier.Validate(invalidEnvelope, invalidRoot, Options, Now));
+    }
+
     private static UpdateManifest TestManifest() => new(
         1, 7, "stable", "linux", "x64", "1.0.0", "1.0.0", 1,
         Now.AddHours(-1), Now.AddDays(1),
@@ -91,7 +151,7 @@ public sealed class ManifestVerifierTests
 
     private static (SignedManifest Envelope, TrustRoot Root) SignedManifestFor(UpdateManifest manifest, int threshold)
     {
-        var payload = JsonSerializer.SerializeToUtf8Bytes(manifest, TrustRoot.JsonOptions);
+        var payload = ManifestCanonicalizer.Serialize(manifest);
         var keys = new List<TrustedKey>();
         var signatures = new List<ManifestSignature>();
         for (var i = 0; i < 2; i++)
