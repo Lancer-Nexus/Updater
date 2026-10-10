@@ -57,6 +57,43 @@ public sealed class StartupHealthTests
         }
     }
 
+    [Theory]
+    [InlineData("gateway-update-required", ReleaseActivator.StartResult.UpdateRequired)]
+    [InlineData("repair-required", ReleaseActivator.StartResult.RepairRequired)]
+    public async Task ClientExitRequestsAreReturnedAfterTheHealthHandshake(string marker,
+        ReleaseActivator.StartResult expected)
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"updater-client-exit-{Guid.NewGuid():N}");
+        var stage = Path.Combine(root, "staging", "release");
+        Directory.CreateDirectory(stage);
+        var client = new UpdatePackage("client", "1.0.0", "client.tar.zst", 1,
+            new string('a', 64), true, "tar.zst");
+        var manifest = Manifest("1.0.0", "exit-test", "exit-test-data");
+        var options = new UpdaterOptions(new Uri("https://updates.example.test/manifest"),
+            "stable", "linux", "x64", "trusted-root.json", InstallRootPath: root);
+        try
+        {
+            await InstallProbeAsync(stage);
+            await File.WriteAllTextAsync(Path.Combine(stage, marker), string.Empty);
+            await WriteClientMetadataAsync(stage, manifest);
+            await DataPackageStager.WriteSnapshotAsync(stage, manifest,
+                new HashSet<string>(StringComparer.Ordinal),
+                new Dictionary<string, string>(StringComparer.Ordinal), CancellationToken.None);
+            ReleaseActivator.Activate(stage, manifest, client, options);
+
+            var result = await ReleaseActivator.TryStartCurrentAsync(
+                manifest, client, options, CancellationToken.None);
+
+            Assert.Equal(expected, result);
+            using var pointer = JsonDocument.Parse(await File.ReadAllTextAsync(Path.Combine(root, "current.json")));
+            Assert.Equal(JsonValueKind.Null, pointer.RootElement.GetProperty("previous").ValueKind);
+        }
+        finally
+        {
+            await DeleteDirectoryAsync(root);
+        }
+    }
+
     [Fact]
     public async Task FailedNewReleaseRestoresAndStartsThePreviouslyHealthyLegacyRelease()
     {
@@ -79,7 +116,12 @@ public sealed class StartupHealthTests
                 newManifest, newClient, options, CancellationToken.None);
             Assert.Equal(ReleaseActivator.StartResult.Failed, failed);
             Assert.True(ReleaseActivator.RollbackCurrent(options));
-            Assert.True(await ReleaseActivator.TryStartRestoredCurrentAsync(options, CancellationToken.None));
+            Assert.False(ReleaseActivator.IsCurrentVerified(newManifest, newClient, options));
+            Assert.False(GatewayUpdatePolicy.ShouldRejectUnchangedUpdateRequest(newManifest, newClient,
+                newManifest, newClient, new HashSet<string>(StringComparer.Ordinal),
+                installedReleaseMatchesPreviousManifest: false));
+            Assert.Equal(ReleaseActivator.StartResult.Healthy,
+                await ReleaseActivator.TryStartRestoredCurrentAsync(options, CancellationToken.None));
 
             using var pointer = JsonDocument.Parse(await File.ReadAllTextAsync(Path.Combine(root, "current.json")));
             Assert.Equal(Path.GetFileName(oldRelease),
@@ -120,7 +162,8 @@ public sealed class StartupHealthTests
             FailedReleaseStore.Record(root, newManifest, newClient, noOptionalPackages);
             Assert.True(FailedReleaseStore.IsKnownFailure(root, newManifest, newClient, noOptionalPackages));
             Assert.True(ReleaseActivator.RollbackCurrent(options));
-            Assert.True(await ReleaseActivator.TryStartRestoredCurrentAsync(options, CancellationToken.None));
+            Assert.Equal(ReleaseActivator.StartResult.Healthy,
+                await ReleaseActivator.TryStartRestoredCurrentAsync(options, CancellationToken.None));
 
             using var pointer = JsonDocument.Parse(await File.ReadAllTextAsync(Path.Combine(root, "current.json")));
             Assert.Equal(Path.GetFileName(oldRelease),
@@ -141,6 +184,15 @@ public sealed class StartupHealthTests
         await InstallProbeAsync(stage);
         if (marker is not null)
             await File.WriteAllTextAsync(Path.Combine(stage, marker), string.Empty);
+        await WriteClientMetadataAsync(stage, manifest, healthProtocol);
+        await DataPackageStager.WriteSnapshotAsync(stage, manifest,
+            new HashSet<string>(StringComparer.Ordinal),
+            new Dictionary<string, string>(StringComparer.Ordinal), CancellationToken.None);
+        return stage;
+    }
+
+    private static async Task WriteClientMetadataAsync(string stage, UpdateManifest manifest, int healthProtocol = 1)
+    {
         var metadata = new
         {
             clientVersion = manifest.ClientVersion,
@@ -154,10 +206,6 @@ public sealed class StartupHealthTests
         };
         await File.WriteAllTextAsync(Path.Combine(stage, "client-version.json"),
             JsonSerializer.Serialize(metadata, TrustRoot.JsonOptions));
-        await DataPackageStager.WriteSnapshotAsync(stage, manifest,
-            new HashSet<string>(StringComparer.Ordinal),
-            new Dictionary<string, string>(StringComparer.Ordinal), CancellationToken.None);
-        return stage;
     }
 
     private static async Task InstallProbeAsync(string stage)

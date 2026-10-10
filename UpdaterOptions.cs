@@ -6,8 +6,16 @@ public sealed record UpdaterOptions(
     string CachePath = "", string InstallRootPath = "")
 {
     public IReadOnlySet<string> OptionalDataPackages { get; init; } = new HashSet<string>(StringComparer.Ordinal);
+    public Uri? RootMetadataBaseUri { get; init; }
+    public Uri? TufMetadataBaseUri { get; init; }
+    public string RootChainStatePath { get; init; } = "";
+    public string TufMetadataStatePath { get; init; } = "";
 
     public Uri EffectiveArtifactBaseUri => ArtifactBaseUri ?? new Uri(ManifestUri.GetLeftPart(UriPartial.Authority) + "/v1/");
+    public Uri EffectiveRootMetadataBaseUri => RootMetadataBaseUri ??
+        new Uri(ManifestUri.GetLeftPart(UriPartial.Authority) + "/v1/metadata/root/");
+    public Uri EffectiveTufMetadataBaseUri => TufMetadataBaseUri ??
+        new Uri(ManifestUri.GetLeftPart(UriPartial.Authority) + "/v1/metadata/");
 
     public static UpdaterOptions FromEnvironment(string[] args)
     {
@@ -30,6 +38,22 @@ public sealed record UpdaterOptions(
               string.IsNullOrEmpty(configuredBase.Query) && string.IsNullOrEmpty(configuredBase.Fragment)
                 ? configuredBase
                 : throw new InvalidOperationException("Artefakt-Basis muss eine HTTPS-URL mit abschließendem '/' sein.");
+        var rootMetadataBaseRaw = Environment.GetEnvironmentVariable("LANCER_NEXUS_ROOT_METADATA_BASE_URL");
+        var rootMetadataBase = rootMetadataBaseRaw is null
+            ? new Uri(uri.GetLeftPart(UriPartial.Authority) + "/v1/metadata/root/")
+            : Uri.TryCreate(rootMetadataBaseRaw, UriKind.Absolute, out var configuredRootBase) &&
+              configuredRootBase.Scheme == Uri.UriSchemeHttps && configuredRootBase.AbsolutePath.EndsWith('/') &&
+              string.IsNullOrEmpty(configuredRootBase.Query) && string.IsNullOrEmpty(configuredRootBase.Fragment)
+                ? configuredRootBase
+                : throw new InvalidOperationException("TUF root metadata base must be an HTTPS URL with a trailing '/'.");
+        var tufMetadataBaseRaw = Environment.GetEnvironmentVariable("LANCER_NEXUS_TUF_METADATA_BASE_URL");
+        var tufMetadataBase = tufMetadataBaseRaw is null
+            ? new Uri(uri.GetLeftPart(UriPartial.Authority) + "/v1/metadata/")
+            : Uri.TryCreate(tufMetadataBaseRaw, UriKind.Absolute, out var configuredTufBase) &&
+              configuredTufBase.Scheme == Uri.UriSchemeHttps && configuredTufBase.AbsolutePath.EndsWith('/') &&
+              string.IsNullOrEmpty(configuredTufBase.Query) && string.IsNullOrEmpty(configuredTufBase.Fragment)
+                ? configuredTufBase
+                : throw new InvalidOperationException("TUF metadata base must be an HTTPS URL with a trailing '/'.");
         var optionalPackages = (Environment.GetEnvironmentVariable("LANCER_NEXUS_OPTIONAL_PACKAGES") ?? "")
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .ToHashSet(StringComparer.Ordinal);
@@ -47,7 +71,15 @@ public sealed record UpdaterOptions(
             Environment.GetEnvironmentVariable("LANCER_NEXUS_INSTALL_ROOT") ??
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LancerNexus"))
         {
-            OptionalDataPackages = optionalPackages
+            OptionalDataPackages = optionalPackages,
+            RootMetadataBaseUri = rootMetadataBase,
+            TufMetadataBaseUri = tufMetadataBase,
+            RootChainStatePath = Environment.GetEnvironmentVariable("LANCER_NEXUS_ROOT_CHAIN_STATE") ??
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "lancer-nexus",
+                    $"trusted-root-chain-{channel}-{platform}-{architecture}.json"),
+            TufMetadataStatePath = Environment.GetEnvironmentVariable("LANCER_NEXUS_TUF_METADATA_STATE") ??
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "lancer-nexus",
+                    $"trusted-tuf-metadata-{channel}-{platform}-{architecture}.json")
         };
     }
 }

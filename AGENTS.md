@@ -17,6 +17,7 @@ Provide a secure and recoverable Windows/Linux bootstrapper for client and game-
 - Accept only signed `tar.zst` package formats and use the pinned managed Zstandard decoder with strict TAR entry and expanded-size limits.
 - Do not require administrator privileges for per-user installations.
 - Do not start the client when required data packages are missing or invalid.
+- Keep `--start-current` supervising the Client after UI-ready; exit code 42 refreshes signed metadata and permits restart only when runtime identity changes, with a bounded retry count. Exit code 43 permits one repair pass. Never infer these signals from console text.
 - Keep logs useful but free of tokens, credentials and personal data.
 
 ## Verification

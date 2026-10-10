@@ -16,4 +16,8 @@ if (File.Exists(Path.Combine(directory, "fail-startup")))
     return 1;
 
 await File.WriteAllBytesAsync(acknowledgementPath, Encoding.ASCII.GetBytes(acknowledgementToken));
+if (File.Exists(Path.Combine(directory, "gateway-update-required")))
+    return 42;
+if (File.Exists(Path.Combine(directory, "repair-required")))
+    return 43;
 return 0;

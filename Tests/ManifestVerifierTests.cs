@@ -113,6 +113,25 @@ public sealed class ManifestVerifierTests
     }
 
     [Fact]
+    public void TrustRootCannotCountOnePublicKeyUnderMultipleIdsTowardThreshold()
+    {
+        var (envelope, root) = SignedManifestFor(TestManifest(), 1);
+        var originalSignature = envelope.Signatures[0];
+        var aliasedRoot = root with
+        {
+            Threshold = 2,
+            Keys = [root.Keys[0], root.Keys[0] with { KeyId = "release-alias" }]
+        };
+        var aliasedEnvelope = envelope with
+        {
+            Signatures = [originalSignature, originalSignature with { KeyId = "release-alias" }]
+        };
+
+        Assert.Throws<InvalidDataException>(() =>
+            ManifestVerifier.Validate(aliasedEnvelope, aliasedRoot, Options, Now));
+    }
+
+    [Fact]
     public void SignedManifestAcceptsNapPackagesAndRejectsInvalidDependencyGraph()
     {
         var bytes = new byte[] { 1, 2, 3 };

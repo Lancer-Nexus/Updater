@@ -30,6 +30,16 @@ public sealed record TrustedKey(string KeyId, string Algorithm, string PublicKey
 // Distributed with the bootstrapper through a trusted channel; never fetched from the manifest URL.
 public sealed record TrustRoot(int Schema, int Threshold, IReadOnlyList<TrustedKey> Keys, long MinimumManifestVersion)
 {
+    public long RootVersion { get; init; }
+    public DateTime RootExpiresAtUtc { get; init; } = DateTime.SpecifyKind(DateTime.MaxValue, DateTimeKind.Utc);
+    public IReadOnlyList<TrustedKey>? RootRoleKeys { get; init; }
+    public int RootRoleThreshold { get; init; }
+    public IReadOnlyList<TrustedKey>? TimestampRoleKeys { get; init; }
+    public int TimestampRoleThreshold { get; init; }
+    public IReadOnlyList<TrustedKey>? SnapshotRoleKeys { get; init; }
+    public int SnapshotRoleThreshold { get; init; }
+    public bool ConsistentSnapshot { get; init; }
+
     public static TrustRoot Load(string path) =>
         JsonSerializer.Deserialize<TrustRoot>(File.ReadAllBytes(path), JsonOptions)
         ?? throw new InvalidDataException("Trust root ist leer.");
@@ -45,15 +55,43 @@ public static class ManifestClient
     internal static async Task<SignedManifest> LoadAsync(
         Uri uri, CancellationToken cancellationToken, HttpMessageHandler? testHandler)
     {
+        var bytes = await LoadBytesAsync(uri, cancellationToken, testHandler, "Signiertes Manifest");
+        try
+        {
+            return JsonSerializer.Deserialize<SignedManifest>(bytes, TrustRoot.JsonOptions)
+                ?? throw new InvalidDataException("Signiertes Manifest ist leer.");
+        }
+        catch (JsonException error)
+        {
+            throw new InvalidDataException("Signiertes Manifest ist kein gültiges JSON.", error);
+        }
+    }
+
+    public static Task<byte[]> LoadTufMetadataBytesAsync(Uri uri, CancellationToken cancellationToken) =>
+        LoadTufMetadataBytesAsync(uri, cancellationToken, null);
+
+    internal static Task<byte[]> LoadTufMetadataBytesAsync(Uri uri, CancellationToken cancellationToken,
+        HttpMessageHandler? testHandler) => LoadBytesAsync(uri, cancellationToken, testHandler, "TUF metadata");
+
+    public static Task<byte[]> LoadBytesAsync(Uri uri, CancellationToken cancellationToken) =>
+        LoadBytesAsync(uri, cancellationToken, null, "Signiertes Manifest");
+
+    internal static Task<byte[]> LoadBytesAsync(Uri uri, CancellationToken cancellationToken,
+        HttpMessageHandler? testHandler) => LoadBytesAsync(uri, cancellationToken, testHandler, "Signiertes Manifest");
+
+    private static async Task<byte[]> LoadBytesAsync(Uri uri, CancellationToken cancellationToken,
+        HttpMessageHandler? testHandler, string description)
+    {
         if (!uri.IsAbsoluteUri || uri.Scheme != Uri.UriSchemeHttps)
-            throw new InvalidOperationException("Manifest URL muss HTTPS verwenden.");
+            throw new InvalidOperationException($"{description} URL muss HTTPS verwenden.");
         using var handler = testHandler ?? new HttpClientHandler { AllowAutoRedirect = false };
-        using var client = new HttpClient(handler, disposeHandler: testHandler is null) { Timeout = TimeSpan.FromSeconds(30) };
+        using var client = new HttpClient(handler, disposeHandler: testHandler is null)
+        { Timeout = TimeSpan.FromSeconds(30) };
         using var response = await client.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         response.EnsureSuccessStatusCode();
         const int maximumBytes = 2_097_152;
         if (response.Content.Headers.ContentLength > maximumBytes)
-            throw new InvalidDataException("Signiertes Manifest ist zu groß.");
+            throw new InvalidDataException($"{description} überschreitet 2 MiB.");
         await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
         using var buffer = new MemoryStream();
         var chunk = new byte[8192];
@@ -61,12 +99,40 @@ public static class ManifestClient
         while ((count = await source.ReadAsync(chunk, cancellationToken)) != 0)
         {
             if (buffer.Length + count > maximumBytes)
-                throw new InvalidDataException("Signiertes Manifest ist zu groß.");
+                throw new InvalidDataException($"{description} überschreitet 2 MiB.");
             buffer.Write(chunk, 0, count);
         }
-        buffer.Position = 0;
-        return await JsonSerializer.DeserializeAsync<SignedManifest>(buffer, TrustRoot.JsonOptions, cancellationToken)
-            ?? throw new InvalidDataException("Signiertes Manifest ist leer.");
+        return buffer.ToArray();
+    }
+
+    public static async Task<byte[]?> LoadRootMetadataAsync(Uri uri, CancellationToken cancellationToken) =>
+        await LoadRootMetadataAsync(uri, cancellationToken, null);
+
+    internal static async Task<byte[]?> LoadRootMetadataAsync(
+        Uri uri, CancellationToken cancellationToken, HttpMessageHandler? testHandler)
+    {
+        if (!uri.IsAbsoluteUri || uri.Scheme != Uri.UriSchemeHttps)
+            throw new InvalidOperationException("TUF root metadata URL muss HTTPS verwenden.");
+        using var handler = testHandler ?? new HttpClientHandler { AllowAutoRedirect = false };
+        using var client = new HttpClient(handler, disposeHandler: testHandler is null)
+        { Timeout = TimeSpan.FromSeconds(30) };
+        using var response = await client.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        if (response.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        response.EnsureSuccessStatusCode();
+        const int maximumBytes = 64 * 1024;
+        if (response.Content.Headers.ContentLength > maximumBytes)
+            throw new InvalidDataException("TUF root metadata exceeds its size limit.");
+        await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var buffer = new MemoryStream();
+        var chunk = new byte[4096];
+        int count;
+        while ((count = await source.ReadAsync(chunk, cancellationToken)) != 0)
+        {
+            if (buffer.Length + count > maximumBytes)
+                throw new InvalidDataException("TUF root metadata exceeds its size limit.");
+            buffer.Write(chunk, 0, count);
+        }
+        return buffer.ToArray();
     }
 }
 
@@ -74,11 +140,7 @@ public static class ManifestVerifier
 {
     public static UpdateManifest Validate(SignedManifest envelope, TrustRoot root, UpdaterOptions options, DateTime nowUtc)
     {
-        if (root.Schema != 1 || root.Threshold < 1 || root.Keys is null || root.Threshold > root.Keys.Count ||
-            root.MinimumManifestVersion < 1 || root.Keys.Any(k => string.IsNullOrWhiteSpace(k.KeyId) ||
-                k.Algorithm != "Ed25519" || string.IsNullOrWhiteSpace(k.PublicKey)) ||
-            root.Keys.Select(k => k.KeyId).Distinct(StringComparer.Ordinal).Count() != root.Keys.Count)
-            throw new InvalidDataException("Trust root ist ungültig.");
+        ValidateTrustRoot(root);
         if (envelope.Signatures is null || string.IsNullOrWhiteSpace(envelope.Signed))
             throw new InvalidDataException("Manifest-Signatur fehlt.");
 
@@ -197,5 +259,44 @@ public static class ManifestVerifier
         if (dataIds.Any(HasDependencyCycle))
             throw new InvalidDataException("NAP-Paketabhängigkeiten enthalten einen Zyklus.");
         return manifest;
+    }
+
+    internal static void ValidateTrustRoot(TrustRoot root)
+    {
+        ArgumentNullException.ThrowIfNull(root);
+        if (root.Schema != 1 || root.MinimumManifestVersion < 1 || root.RootVersion < 0 ||
+            root.RootExpiresAtUtc.Kind != DateTimeKind.Utc || root.Keys is null ||
+            root.RootRoleKeys is null && root.RootRoleThreshold != 0 ||
+            root.RootRoleKeys is not null && (root.RootRoleThreshold < 1 || root.RootRoleThreshold > root.RootRoleKeys.Count))
+            throw new InvalidDataException("Trust root ist ungültig.");
+        ValidateKeySet(root.Keys, root.Threshold);
+        if (root.RootRoleKeys is { } rootKeys) ValidateKeySet(rootKeys, root.RootRoleThreshold);
+        if ((root.TimestampRoleKeys is null) != (root.TimestampRoleThreshold == 0) ||
+            (root.SnapshotRoleKeys is null) != (root.SnapshotRoleThreshold == 0))
+            throw new InvalidDataException("Trust root role keys and thresholds must be configured together.");
+        if (root.TimestampRoleKeys is { } timestampKeys) ValidateKeySet(timestampKeys, root.TimestampRoleThreshold);
+        if (root.SnapshotRoleKeys is { } snapshotKeys) ValidateKeySet(snapshotKeys, root.SnapshotRoleThreshold);
+    }
+
+    private static void ValidateKeySet(IReadOnlyList<TrustedKey> keys, int threshold)
+    {
+        if (threshold < 1 || threshold > keys.Count || keys.Any(key => key is null ||
+                string.IsNullOrWhiteSpace(key.KeyId) || key.Algorithm != "Ed25519" || key.PublicKey is not { Length: 44 }) ||
+            keys.Select(key => key.KeyId).Distinct(StringComparer.Ordinal).Count() != keys.Count)
+            throw new InvalidDataException("Trust root ist ungültig.");
+        var publicKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var key in keys)
+        {
+            byte[] publicKey;
+            try { publicKey = Convert.FromBase64String(key.PublicKey); }
+            catch (FormatException error)
+            {
+                throw new InvalidDataException("Trust root enthält einen ungültigen Ed25519-Schlüssel.", error);
+            }
+            var canonicalPublicKey = Convert.ToBase64String(publicKey);
+            if (publicKey.Length != 32 || !string.Equals(canonicalPublicKey, key.PublicKey, StringComparison.Ordinal) ||
+                !publicKeys.Add(canonicalPublicKey))
+                throw new InvalidDataException("Trust root enthält einen ungültigen oder doppelten Ed25519-Schlüssel.");
+        }
     }
 }

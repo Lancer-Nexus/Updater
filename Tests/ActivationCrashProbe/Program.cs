@@ -13,6 +13,31 @@ if (args.Length == 2 && args[0] == "--lock-check")
     }
 }
 
+if (args.Length == 7 && args[0] == "--failed-start")
+{
+    var failedInstallRoot = args[1];
+    if (!long.TryParse(args[2], out var failedManifestVersion)) return 2;
+    var failedClientVersion = args[3];
+    var failedBuildId = args[4];
+    var failedDataManifestId = args[5];
+    var failedPackageHash = args[6];
+    var failedPackage = new UpdatePackage("client", failedClientVersion, "client.tar.zst", 1,
+        failedPackageHash, true, "tar.zst");
+    var failedManifest = new UpdateManifest(1, failedManifestVersion, "stable", "linux", "x64", failedClientVersion,
+        "1.0.0", 1, DateTime.UtcNow.AddMinutes(-1), DateTime.UtcNow.AddHours(1), [failedPackage])
+    {
+        BuildId = failedBuildId,
+        DataManifestId = failedDataManifestId,
+        Capabilities = []
+    };
+    var failedOptions = new UpdaterOptions(new Uri("https://updates.example.test/manifest"),
+        "stable", "linux", "x64", "trusted-root.json", InstallRootPath: failedInstallRoot);
+
+    FailedReleaseRecovery.RecordFailureAndRollback(failedInstallRoot, failedManifest, failedPackage,
+        new HashSet<string>(StringComparer.Ordinal), failedOptions, () => Environment.Exit(74));
+    return 0;
+}
+
 if (args.Length != 7)
     return 2;
 

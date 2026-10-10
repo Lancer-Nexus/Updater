@@ -7,17 +7,24 @@ namespace LancerNexus.Updater;
 
 public static class ReleaseActivator
 {
-    public enum StartResult { NotCurrent, Healthy, Failed }
+    public enum StartResult { NotCurrent, Healthy, Failed, UpdateRequired, RepairRequired }
     internal enum ActivationBoundary { ReleaseDirectoryMoved, PointerTemporaryWritten, CurrentPointerReplaced }
+    internal enum ActivationIoOperation { ReleaseDirectoryMove, CurrentPointerReplace }
     private static readonly TimeSpan HealthTimeout = TimeSpan.FromMinutes(5);
 
     public static async Task<StartResult> TryStartCurrentAsync(UpdateManifest manifest,
         UpdatePackage clientPackage, UpdaterOptions options, CancellationToken cancellationToken)
-        => await TryStartCurrentAsync(manifest, clientPackage, options, HealthTimeout, cancellationToken);
+        => await TryStartCurrentAsync(manifest, clientPackage, options, HealthTimeout, cancellationToken, null);
+
+    public static async Task<StartResult> TryStartCurrentAsync(UpdateManifest manifest,
+        UpdatePackage clientPackage, UpdaterOptions options, CancellationToken cancellationToken,
+        Func<Task>? onHealthAcknowledged)
+        => await TryStartCurrentAsync(manifest, clientPackage, options, HealthTimeout, cancellationToken,
+            onHealthAcknowledged);
 
     internal static async Task<StartResult> TryStartCurrentAsync(UpdateManifest manifest,
         UpdatePackage clientPackage, UpdaterOptions options, TimeSpan healthTimeout,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, Func<Task>? onHealthAcknowledged = null)
     {
         if (healthTimeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(healthTimeout));
@@ -28,24 +35,27 @@ public static class ReleaseActivator
         var releasePath = ResolveReleasePath(installRoot, current!.ReleaseDirectory)!;
         var executableName = OperatingSystem.IsWindows() ? "lancer.exe" : "lancer";
         var executablePath = Path.Combine(releasePath, executableName);
-        bool healthy;
-        try { healthy = await StartAndAwaitHealthAsync(executablePath, releasePath, installRoot, healthTimeout, cancellationToken); }
+        ClientExecutionResult execution;
+        try
+        {
+            execution = await StartAndAwaitHealthAsync(executablePath, releasePath, installRoot,
+                healthTimeout, cancellationToken, onHealthAcknowledged);
+        }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException or System.ComponentModel.Win32Exception)
         {
             Console.Error.WriteLine($"Clientstart/Health-Handshake fehlgeschlagen: {error.Message}");
-            healthy = false;
+            return StartResult.Failed;
         }
-        if (healthy) MarkCurrentHealthy(installRoot);
-        return healthy ? StartResult.Healthy : StartResult.Failed;
+        if (execution.ExitCode == 42) return StartResult.UpdateRequired;
+        if (execution.ExitCode == 43) return StartResult.RepairRequired;
+        return execution.HealthAcknowledged ? StartResult.Healthy : StartResult.Failed;
     }
 
     public static bool IsCurrentVerified(UpdateManifest manifest, UpdatePackage clientPackage, UpdaterOptions options)
     {
         var installRoot = Path.GetFullPath(options.InstallRootPath);
         var current = TryReadCurrentRelease(Path.Combine(installRoot, "current.json"));
-        if (current is null || current.PackageSha256 != clientPackage.Sha256 ||
-            current.ClientVersion != manifest.ClientVersion || current.BuildId != manifest.BuildId ||
-            current.DataManifestId != manifest.DataManifestId)
+        if (current is null || !MatchesReleaseTarget(current, manifest, clientPackage))
             return false;
 
         var releasePath = ResolveReleasePath(installRoot, current.ReleaseDirectory);
@@ -67,6 +77,27 @@ public static class ReleaseActivator
         return true;
     }
 
+    public static bool IsCurrentReleaseTarget(UpdateManifest manifest, UpdatePackage clientPackage,
+        UpdaterOptions options) =>
+        MatchesReleaseTarget(TryReadCurrentRelease(Path.Combine(Path.GetFullPath(options.InstallRootPath), "current.json")),
+            manifest, clientPackage);
+
+    /// <summary>Restores the previous release if the active pointer still names a known-failed target.</summary>
+    public static bool RollbackFailedCurrentReleaseIfNeeded(UpdateManifest manifest, UpdatePackage clientPackage,
+        UpdaterOptions options)
+    {
+        if (!IsCurrentReleaseTarget(manifest, clientPackage, options)) return false;
+        if (!RollbackCurrent(options))
+            throw new InvalidOperationException("The failed active release has no previous release to restore.");
+        return true;
+    }
+
+    private static bool MatchesReleaseTarget(CurrentRelease? current, UpdateManifest manifest,
+        UpdatePackage clientPackage) =>
+        current is not null && current.PackageSha256 == clientPackage.Sha256 &&
+        current.ClientVersion == manifest.ClientVersion && current.BuildId == manifest.BuildId &&
+        current.DataManifestId == manifest.DataManifestId;
+
     public static bool RollbackCurrent(UpdaterOptions options)
     {
         var installRoot = Path.GetFullPath(options.InstallRootPath);
@@ -78,40 +109,42 @@ public static class ReleaseActivator
         return true;
     }
 
-    public static async Task<bool> TryStartRestoredCurrentAsync(UpdaterOptions options,
-        CancellationToken cancellationToken)
+    public static async Task<StartResult> TryStartRestoredCurrentAsync(UpdaterOptions options,
+        CancellationToken cancellationToken, Func<Task>? onHealthAcknowledged = null)
     {
         var installRoot = Path.GetFullPath(options.InstallRootPath);
         var current = TryReadCurrentRelease(Path.Combine(installRoot, "current.json"));
-        if (current is null) return false;
+        if (current is null) return StartResult.NotCurrent;
         var releasePath = ResolveReleasePath(installRoot, current.ReleaseDirectory);
         if (releasePath is null || !Directory.Exists(releasePath) ||
             (File.GetAttributes(releasePath) & FileAttributes.ReparsePoint) != 0)
-            return false;
+            return StartResult.Failed;
         if (!MetadataIsSane(Path.Combine(releasePath, "client-version.json")))
-            return false;
+            return StartResult.Failed;
         var executable = Path.Combine(releasePath, OperatingSystem.IsWindows() ? "lancer.exe" : "lancer");
         if (!File.Exists(executable) || (File.GetAttributes(executable) & FileAttributes.ReparsePoint) != 0 ||
             !DataPackageStager.VerifyStoredSnapshot(releasePath))
-            return false;
+            return StartResult.Failed;
         if (!OperatingSystem.IsWindows() &&
             (File.GetUnixFileMode(executable) & (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) == 0)
-            return false;
-        bool healthy;
+            return StartResult.Failed;
+        ClientExecutionResult execution;
         try
         {
             var metadataPath = Path.Combine(releasePath, "client-version.json");
-            healthy = UsesStartupHealthProtocol(metadataPath)
-                ? await StartAndAwaitHealthAsync(executable, releasePath, installRoot, HealthTimeout, cancellationToken)
-                : StartLegacyRelease(executable, releasePath);
+            if (!UsesStartupHealthProtocol(metadataPath))
+                return StartLegacyRelease(executable, releasePath) ? StartResult.Healthy : StartResult.Failed;
+            execution = await StartAndAwaitHealthAsync(executable, releasePath, installRoot,
+                HealthTimeout, cancellationToken, onHealthAcknowledged);
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException or System.ComponentModel.Win32Exception)
         {
             Console.Error.WriteLine($"Rollback-Start/Health-Handshake fehlgeschlagen: {error.Message}");
-            healthy = false;
+            return StartResult.Failed;
         }
-        if (healthy) MarkCurrentHealthy(installRoot);
-        return healthy;
+        if (execution.ExitCode == 42) return StartResult.UpdateRequired;
+        if (execution.ExitCode == 43) return StartResult.RepairRequired;
+        return execution.HealthAcknowledged ? StartResult.Healthy : StartResult.Failed;
     }
 
     public static string Activate(string stagedRelease, UpdateManifest manifest, UpdatePackage clientPackage,
@@ -119,20 +152,26 @@ public static class ReleaseActivator
         => Activate(stagedRelease, manifest, clientPackage, options, null);
 
     internal static string Activate(string stagedRelease, UpdateManifest manifest, UpdatePackage clientPackage,
-        UpdaterOptions options, Action<ActivationBoundary>? onBoundary)
+        UpdaterOptions options, Action<ActivationBoundary>? onBoundary,
+        Action<ActivationIoOperation>? beforeIoOperation = null)
     {
         var installRoot = Path.GetFullPath(options.InstallRootPath);
         var stagingRoot = Path.Combine(installRoot, "staging");
         var expectedStagingRoot = Path.GetFullPath(stagingRoot) + Path.DirectorySeparatorChar;
         var stagedPath = Path.GetFullPath(stagedRelease);
-        if (!stagedPath.StartsWith(expectedStagingRoot, StringComparison.Ordinal) ||
-            !Directory.Exists(stagedPath) || Path.GetFileName(stagedPath).Length == 0)
+        var pathComparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (!stagedPath.StartsWith(expectedStagingRoot, pathComparison) ||
+            !Directory.Exists(stagedPath) || Path.GetFileName(stagedPath).Length == 0 ||
+            HasReparsePoint(installRoot, stagedPath))
             throw new InvalidOperationException("Stagingrelease liegt nicht im Installations-Stagingbereich.");
 
         var releasesRoot = Path.Combine(installRoot, "releases");
         Directory.CreateDirectory(releasesRoot);
+        if (HasReparsePoint(installRoot, releasesRoot))
+            throw new InvalidOperationException("Releaseverzeichnis enthält einen nicht erlaubten Reparse-Point.");
         var releaseName = Path.GetFileName(stagedPath);
         var releasePath = Path.Combine(releasesRoot, releaseName);
+        beforeIoOperation?.Invoke(ActivationIoOperation.ReleaseDirectoryMove);
         Directory.Move(stagedPath, releasePath);
         onBoundary?.Invoke(ActivationBoundary.ReleaseDirectoryMoved);
 
@@ -142,7 +181,8 @@ public static class ReleaseActivator
             $"releases/{releaseName}", previous?.ReleaseDirectory, clientPackage.Sha256,
             manifest.DataManifestId, DateTime.UtcNow, previous is null ? null : previous with { Previous = null });
         WriteCurrent(pointerPath, pointer,
-            () => onBoundary?.Invoke(ActivationBoundary.PointerTemporaryWritten));
+            () => onBoundary?.Invoke(ActivationBoundary.PointerTemporaryWritten),
+            () => beforeIoOperation?.Invoke(ActivationIoOperation.CurrentPointerReplace));
         onBoundary?.Invoke(ActivationBoundary.CurrentPointerReplaced);
         return releasePath;
     }
@@ -179,6 +219,22 @@ public static class ReleaseActivator
         var releasesRoot = Path.GetFullPath(Path.Combine(installRoot, "releases")) + Path.DirectorySeparatorChar;
         var releasePath = Path.GetFullPath(Path.Combine(installRoot, relativePath.Replace('/', Path.DirectorySeparatorChar)));
         return releasePath.StartsWith(releasesRoot, StringComparison.Ordinal) ? releasePath : null;
+    }
+
+    private static bool HasReparsePoint(string root, string path)
+    {
+        if (!Directory.Exists(root) || (File.GetAttributes(root) & FileAttributes.ReparsePoint) != 0)
+            return true;
+        var relative = Path.GetRelativePath(root, path);
+        if (relative == ".") return false;
+        var current = root;
+        foreach (var component in relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+        {
+            current = Path.Combine(current, component);
+            if (!Directory.Exists(current) || (File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                return true;
+        }
+        return false;
     }
 
     private static bool MetadataMatches(string metadataPath, UpdateManifest manifest)
@@ -260,8 +316,11 @@ public static class ReleaseActivator
         return true;
     }
 
-    private static async Task<bool> StartAndAwaitHealthAsync(string executablePath, string releasePath,
-        string installRoot, TimeSpan healthTimeout, CancellationToken cancellationToken)
+    private sealed record ClientExecutionResult(bool HealthAcknowledged, int? ExitCode);
+
+    private static async Task<ClientExecutionResult> StartAndAwaitHealthAsync(string executablePath,
+        string releasePath, string installRoot, TimeSpan healthTimeout, CancellationToken cancellationToken,
+        Func<Task>? onHealthAcknowledged)
     {
         var healthDirectory = Path.Combine(installRoot, "health");
         Directory.CreateDirectory(healthDirectory);
@@ -278,7 +337,7 @@ public static class ReleaseActivator
                 ["LANCER_NEXUS_HEALTH_ACK_TOKEN"] = token
             }
         });
-        if (process is null) return false;
+        if (process is null) return new(false, null);
         Console.WriteLine($"LibreLancer gestartet (PID {process.Id}); warte auf erfolgreiche Daten- und UI-Initialisierung.");
         var deadline = DateTime.UtcNow + healthTimeout;
         var acknowledged = false;
@@ -296,14 +355,21 @@ public static class ReleaseActivator
                         if (CryptographicOperations.FixedTimeEquals(ack, Encoding.ASCII.GetBytes(token)))
                         {
                             acknowledged = true;
-                            return true;
+                            MarkCurrentHealthy(installRoot);
+                            if (onHealthAcknowledged is not null)
+                                await onHealthAcknowledged();
+                            break;
                         }
                     }
                 }
-                if (process.HasExited) return false;
+                if (process.HasExited)
+                    return new(false, process.ExitCode);
+                if (acknowledged) break;
                 await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken);
             }
-            return false;
+            if (!acknowledged) return new(false, process.HasExited ? process.ExitCode : null);
+            await process.WaitForExitAsync(cancellationToken);
+            return new(true, process.ExitCode);
         }
         finally
         {
@@ -333,7 +399,8 @@ public static class ReleaseActivator
             WriteCurrent(pointerPath, current with { Previous = null });
     }
 
-    private static void WriteCurrent(string path, CurrentRelease pointer, Action? onTemporaryWritten = null)
+    private static void WriteCurrent(string path, CurrentRelease pointer, Action? onTemporaryWritten = null,
+        Action? beforeReplace = null)
     {
         var directory = Path.GetDirectoryName(path)!;
         Directory.CreateDirectory(directory);
@@ -347,6 +414,7 @@ public static class ReleaseActivator
                 output.Flush(flushToDisk: true);
             }
             onTemporaryWritten?.Invoke();
+            beforeReplace?.Invoke();
             File.Move(temporaryPath, path, overwrite: true);
         }
         finally
